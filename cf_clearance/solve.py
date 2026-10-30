@@ -3,21 +3,10 @@ import time
 from typing import Optional, Tuple
 
 from core.logger import get_logger
+from core.templates import CF_INTERSTITIAL_JS
 from turnstile.solve import click_turnstile_checkbox
 
 logger = get_logger()
-
-CF_MARKERS_JS = r"""() => {
-  const html = document.documentElement.outerHTML;
-  const t = (document.title || '').toLowerCase();
-  return (
-    !!document.querySelector('#challenge-form, form#challenge-form') ||
-    !!document.querySelector('#cf-wrapper, .cf-browser-verification, #challenge-running, #trk_jschal_js') ||
-    !!document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-    /window\._cf_chl_opt|__cf_chl_/.test(html) ||
-    /just a moment|attention required|checking your browser|verifying you are human/.test(t)
-  );
-}"""
 
 REPLAY_WARNING = (
     "cf_clearance is bound to IP + JA3/TLS + User-Agent. Replay only from the "
@@ -31,35 +20,48 @@ def find_clearance(cookies: list) -> Optional[dict]:
 
 async def is_interstitial(page) -> bool:
     try:
-        return bool(await page.evaluate(CF_MARKERS_JS))
+        return bool(await page.evaluate(CF_INTERSTITIAL_JS))
     except Exception:
         return False
 
 
 async def _wait_clearance(page, timeout_s: int) -> Tuple[Optional[dict], list]:
     deadline = time.monotonic() + timeout_s
+    clearance: Optional[dict] = None
+    cookies: list = []
     while time.monotonic() < deadline:
         cookies = await page.context.cookies()
-        clearance = find_clearance(cookies)
-        if clearance and not await is_interstitial(page):
+        found = find_clearance(cookies)
+        if found:
+            clearance = found
+        interstitial = await is_interstitial(page)
+        if clearance and not interstitial:
             return clearance, cookies
-        if clearance:
-            await asyncio.sleep(1)
-            cookies = await page.context.cookies()
-            return find_clearance(cookies), cookies
         await asyncio.sleep(1)
-    return None, await page.context.cookies()
+    return clearance, cookies
 
 
 async def solve(page, url: str, timeout_s: int = 60) -> dict:
     """Pass the Cloudflare interstitial on a real page and harvest cf_clearance."""
     start = time.monotonic()
-    await page.goto(url, wait_until='domcontentloaded', timeout=45000)
-
+    status = None
     try:
-        await click_turnstile_checkbox(page, attempts=8)
-    except Exception:
-        pass
+        response = await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+        status = response.status if response else None
+    except Exception as exc:
+        logger.warning(f"cf_clearance navigation failed: {exc}")
+
+    if status and status >= 400:
+        logger.info(f"cf_clearance page returned HTTP {status}; waiting for challenge")
+
+    # A Cloudflare WAF/Turnstile interstitial may need an interaction. Only
+    # click when one is actually present, so we never disturb an already
+    # solved page or an SPA that renders its own widget later.
+    if await is_interstitial(page):
+        try:
+            await click_turnstile_checkbox(page, attempts=8)
+        except Exception:
+            pass
 
     clearance, cookies = await _wait_clearance(page, timeout_s)
     ua = await page.evaluate('() => navigator.userAgent')

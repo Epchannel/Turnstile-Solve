@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import signal
+import sys
 import time
 import uuid
 from typing import Awaitable, Callable, Optional
@@ -21,9 +22,12 @@ from core.browser import (
     close_browser,
     context_options,
     launch_browser,
+    mask_proxy,
+    parse_proxy,
     pick_proxy,
 )
 from core.logger import COLORS, get_logger
+from core.stealth import apply_stealth, fingerprint, log_fingerprint
 
 logger = get_logger("SolverAPI")
 
@@ -50,6 +54,8 @@ INDEX_HTML = """
             <li><strong>url</strong>: The URL where Turnstile is to be validated</li>
             <li><strong>sitekey</strong>: The site key for Turnstile</li>
             <li><strong>action</strong> / <strong>cdata</strong>: optional widget bindings</li>
+            <li><strong>proxy</strong>: optional per-request proxy, e.g. <code>http://user:pass@host:port</code></li>
+            <li><strong>timeout</strong>: optional, seconds (default 90)</li>
         </ul>
         <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-red-500">
             <p class="font-semibold mb-2 text-red-400">Example usage:</p>
@@ -106,7 +112,7 @@ def display_welcome() -> None:
     combined_text.append("\n📁 GitHub: ", style="bold white")
     combined_text.append("https://github.com/D3-vin", style="cyan")
     combined_text.append("\n📁 Version: ", style="bold white")
-    combined_text.append("2.0", style="green")
+    combined_text.append("2.1.0", style="green")
     combined_text.append("\n")
 
     info_panel = Panel(
@@ -118,8 +124,11 @@ def display_welcome() -> None:
         padding=(0, 1),
         width=50,
     )
-    console.print(info_panel)
-    console.print()
+    try:
+        console.print(info_panel)
+        console.print()
+    except Exception:
+        pass
 
 
 def _new_task(task_type: str, **meta) -> str:
@@ -147,9 +156,11 @@ async def _periodic_cleanup() -> None:
             logger.error(f"Error during periodic cleanup: {e}")
 
 
-async def _turnstile_job(page, url: str, sitekey: str,
-                         action: Optional[str], cdata: Optional[str]) -> Optional[dict]:
-    token, method = await turnstile_solver.solve(page, url, sitekey, action, cdata)
+async def _turnstile_job(page, url: str, sitekey: str, action: Optional[str],
+                         cdata: Optional[str], timeout_s: int) -> Optional[dict]:
+    token, method = await turnstile_solver.solve(
+        page, url, sitekey, action, cdata, timeout_s
+    )
     if not token:
         return None
     return {'token': token, 'method': method}
@@ -172,9 +183,14 @@ async def _run_solve(task_id: str, job: Callable[..., Awaitable[Optional[dict]]]
         try:
             driver, browser = await launch_browser(config)
             context = await browser.new_context(**context_options(config, proxy))
+            await apply_stealth(context, config)
             page = await context.new_page()
             if config.debug:
-                logger.debug(f"Solve task={task_id} proxy={proxy}")
+                log_fingerprint(await fingerprint(page))
+                logger.debug(
+                    f"Solve task={task_id[:8]} proxy={mask_proxy(proxy)} "
+                    f"headless={config.headless}"
+                )
 
             result = await job(page)
             elapsed = round(time.time() - start, 3)
@@ -185,9 +201,15 @@ async def _run_solve(task_id: str, job: Callable[..., Awaitable[Optional[dict]]]
             else:
                 result['elapsed_time'] = elapsed
                 TASKS[task_id].update(status='ready', result=result)
+                key = 'token' if result.get('token') else 'cf_clearance'
+                if key == 'token':
+                    length = len(result.get('token') or '')
+                else:
+                    length = len((result.get('cf_clearance') or {}).get('value') or '')
                 logger.success(
                     f"Solved - {COLORS['MAGENTA']}{task_id[:8]}"
                     f"{COLORS['RESET']} in {COLORS['GREEN']}{elapsed}{COLORS['RESET']}s"
+                    f" ({key} len={length})"
                 )
         except Exception as e:
             TASKS[task_id].update(status='fail', elapsed=round(time.time() - start, 3))
@@ -213,7 +235,7 @@ def create_app(config: BrowserConfig, threads: int = 4) -> Quart:
         asyncio.create_task(_periodic_cleanup())
         logger.info(
             f"Ready: {config.browser_type}, "
-            f"headless={'new' if config.headless else 'off (--no-headless)'}, "
+            f"headless={'on' if config.headless else 'off (headed)'}, "
             f"max concurrent={threads}"
         )
 
@@ -223,6 +245,10 @@ def create_app(config: BrowserConfig, threads: int = 4) -> Quart:
         sitekey = request.args.get('sitekey')
         action = request.args.get('action')
         cdata = request.args.get('cdata')
+        proxy = request.args.get('proxy') or None
+        timeout_s = request.args.get('timeout', default=90, type=int)
+        if not timeout_s or timeout_s < 10:
+            timeout_s = 90
 
         if not url or not sitekey:
             return jsonify({
@@ -231,17 +257,31 @@ def create_app(config: BrowserConfig, threads: int = 4) -> Quart:
                 "errorDescription": "Both 'url' and 'sitekey' are required",
             }), 200
 
+        if proxy:
+            try:
+                parse_proxy(proxy)
+            except Exception:
+                return jsonify({
+                    "errorId": 1,
+                    "errorCode": "ERROR_WRONG_PROXY",
+                    "errorDescription": "Invalid 'proxy' format",
+                }), 200
+
         task_id = _new_task('turnstile', url=url, sitekey=sitekey)
-        proxy = pick_proxy(config.proxy_support)
-        job = lambda page: _turnstile_job(page, url, sitekey, action, cdata)
-        asyncio.create_task(_run_solve(task_id, job, config, semaphore, proxy))
+        chosen_proxy = proxy or pick_proxy(config.proxy_support)
+        job = lambda page: _turnstile_job(
+            page, url, sitekey, action, cdata, timeout_s
+        )
+        asyncio.create_task(_run_solve(task_id, job, config, semaphore, chosen_proxy))
         return jsonify({"errorId": 0, "taskId": task_id}), 200
 
     @app.route('/cf_clearance', methods=['GET'])
     async def process_cf_clearance():
         url = request.args.get('url')
-        proxy = request.args.get('proxy')
+        proxy = request.args.get('proxy') or None
         timeout_s = request.args.get('timeout', default=60, type=int)
+        if not timeout_s or timeout_s < 10:
+            timeout_s = 60
 
         if not url:
             return jsonify({
@@ -249,6 +289,16 @@ def create_app(config: BrowserConfig, threads: int = 4) -> Quart:
                 "errorCode": "ERROR_WRONG_PAGEURL",
                 "errorDescription": "The 'url' parameter is required",
             }), 200
+
+        if proxy:
+            try:
+                parse_proxy(proxy)
+            except Exception:
+                return jsonify({
+                    "errorId": 1,
+                    "errorCode": "ERROR_WRONG_PROXY",
+                    "errorDescription": "Invalid 'proxy' format",
+                }), 200
 
         task_id = _new_task('cf_clearance', url=url)
         chosen_proxy = proxy or pick_proxy(config.proxy_support)
@@ -294,15 +344,22 @@ def create_app(config: BrowserConfig, threads: int = 4) -> Quart:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Turnstile / cf_clearance Solver API")
-    parser.add_argument('--no-headless', action='store_true',
-                        help='Show browser (default: headless)')
     parser.add_argument('--useragent', type=str,
-                        help='Custom User-Agent (headless: default Chrome 150 + sec-ch-ua)')
+                        help='Custom User-Agent (best left unset for real challenges)')
     parser.add_argument('--debug', action='store_true', help='Debug logging')
     parser.add_argument('--browser_type', type=str, default='chrome',
                         help='chromium, chrome, msedge, camoufox')
     parser.add_argument('--thread', type=int, default=4, help='Max concurrent solves')
     parser.add_argument('--proxy', action='store_true', help='Use proxies.txt')
+    headless_group = parser.add_mutually_exclusive_group()
+    headless_group.add_argument(
+        '--headless', action='store_true',
+        help='Run headless (turnstile test keys only; real Cloudflare challenges need a headed browser)',
+    )
+    headless_group.add_argument(
+        '--no-headless', action='store_true',
+        help='Show the browser window (default; required for real Cloudflare challenges)',
+    )
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=str, default='5072')
     return parser.parse_args()
@@ -326,9 +383,18 @@ def main() -> None:
         logger.error(f"Unknown browser type: {args.browser_type}")
         return
 
+    headless = args.headless
+    if not headless and sys.platform.startswith('linux'):
+        if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+            headless = True
+            logger.warning(
+                "No X11/Wayland display found; falling back to headless. "
+                "Real Cloudflare challenges usually require a headed browser (or Xvfb)."
+            )
+
     config = BrowserConfig(
         browser_type=args.browser_type,
-        headless=not args.no_headless,
+        headless=headless,
         useragent=args.useragent,
         proxy_support=args.proxy,
         debug=args.debug,
